@@ -1,0 +1,896 @@
+---
+title: "lct_mq25_m005"
+output: html_document
+date: "2026-01-30"
+---
+
+
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(snpR)
+library(ggpubr)
+library(ggpmisc)
+library(svglite)
+library(extrafont)
+library(shadowtext)
+library(scico)
+library(poppr)
+library(ggfittext)
+library(grid)
+library(gridExtra)
+
+font_import()
+
+setwd("~/lct/supp_mq25_m005")
+```
+
+
+```{r data}
+
+#this chunk reads in our raw genotype data - data is in "AG" "GG"-type tabular format output from angsd with -dogenos 4. SNPs are rows, samples are columns, no header. First two columns are chromosome and position. This basically just cuts off those first 2 columns and saves them as my snp metadata, replaces the illegal '.' character in my NCBI-formatted chromosome names to "_" (this is a snpR thing), sets the missing genos as "NN" (should already be, this is just a sanity check), imports the metadata, then makes a snpR object using the metadata and the snp metadata. Important: metadata MUST be in exactly the same order as the genos. There is no sample information attached to the genos. Use your bamlist or your column headers if you have them. Don't worry about the warning about repeated facet values, just be careful about running them together.
+
+geno_raw <- read.delim("lct_mq25_m005_all.geno", header=FALSE)
+snp_meta <- geno_raw[,1:2]
+colnames(snp_meta) <- c("chromo","position")
+snp_meta$chromo <- gsub('\\.','_',snp_meta$chromo)
+snp_meta$chrom_pos <- paste0(snp_meta$chromo,"_",snp_meta$position)
+genos <- geno_raw[,3:ncol(geno_raw)]
+genos[is.na(genos)] <- "NN"
+meta <- read.delim("~/lct/supp_mq25_m005/lct_mq25_m005_meta.txt",na.strings="#N/A")
+lct <- import.snpR.data(genos ,sample.meta = meta,snp.meta = snp_meta ,mDat = "NN")
+
+```
+
+```{r filter, echo=FALSE}
+
+#we filtered our data in ANGSD but are filtering again here. But mostly what we're doing is filtering samples that have too much missing data and populations that have <5 samples left after filtering. The only SNP filtering is just to make sure there's at least still a minor allele count of 2 to get rid of singletons. Our ANGSD minmaf filter should have done that already, this is a just-in-case. This takes us from 2613 to 1860 individual samples. 
+
+lct_filt <- filter_snps(lct, min_loci = 0.5, mac=2)
+lct_filt_all_creeks <- lct_filt
+
+#Next we calculate segregating sites just to check the missing data rates for each population. I did this before filtering out my creeks because I wanted to assess it for all creeks, not just the ones with >5 samples. But it's just for checking, it doesn't get used downstream.
+
+lct_pp <- calc_seg_sites(lct_filt,facets = "creek.year")
+lct_pps <- get.snpR.stats(lct_pp,facets="creek.year",stats="seg_sites")$weighted.means
+lct_pps$creek <- str_split_fixed(lct_pps$subfacet,pattern="\\.",2)[,1]
+lct_pps$year <- str_split_fixed(lct_pps$subfacet,pattern="\\.",2)[,2]
+lct_pps <- data.frame("creek"=lct_pps$creek,"year"=as.integer(lct_pps$year),"seg_sites"=lct_pps$seg_sites)
+
+#now we build some pre-filtering metadata 
+
+lct_filt_meta <- sample.meta(lct_filt)
+lct_filt_meta$perc_missing <- sapply(lct_filt, function(col) mean(col == "NN", na.rm = TRUE)) * 100
+creek_meta <- lct_filt_meta %>% group_by(basin,creek,year,creek_year,lat,long,in_will,in_basin,will_name,will_ho,will_pi,will_fis,ws_will,ts_will,PVA_Extinction,PVA_Ext_L95,PVA_Ext_U95,PVA_Abundance_50,PVA_Abundance_25,PVA_Abund_Year) %>% summarise("N"=n(),"perc_missing"=mean(perc_missing))
+creek_meta$year <- as.integer(creek_meta$year)
+creek_meta <- left_join(creek_meta,lct_pps,by=c("creek","year"))
+
+#now we get a list of populations (creek + year) with >5 samples
+good_creek_meta <- filter(creek_meta, N>4)
+good_creeks <- filter(creek_meta, N>4)$creek_year
+
+#also just keep a list of "bad" creeks for having later
+quarantined_creeks <- filter(creek_meta, N<5 & N>1)$creek
+#taking this opportunity to make a WWH dataset because we don't apply the same filtering thresholds to that due to low sample sizes (but it's important to assess these as best we can)
+wwh_and_oob_creeks <- c("Big_Alvord","Cottonwood_AVL", "Little_Alvord", "Mosquito", "Pike","Cottonwood_WWH","Little_Whitehorse","Whitehorse","Willow")
+
+
+#and make a list of individual samples to keep
+good_sample_meta <- filter(lct_filt_meta, creek_year %in% good_creeks)
+good_samples <- filter(lct_filt_meta, creek_year %in% good_creeks)$sample
+basin_list <- unique(good_creek_meta$basin)
+wwh_oob_sample_meta <- filter(lct_filt_meta, creek %in% wwh_and_oob_creeks)
+wwh_oob_samples <- filter(lct_filt_meta, creek %in% wwh_and_oob_creeks)$sample
+
+
+#we keep 1763 total samples from 83 populations, both in-basin and out-of-basin
+lct_filt_wwh_oob <- lct_filt["sample"=c(wwh_oob_samples)]
+lct_filt <- lct_filt["sample"=c(good_samples)]
+lct_filt_wwh_oob_sample_meta <- sample.meta(lct_filt_wwh_oob)
+#we save a copy of this with all our pops that pass filters - both in basin and out-of-basin
+
+lct_filt_allbasins <- lct_filt
+good_sample_meta_both <- sample.meta(lct_filt_allbasins)
+
+#now we take out our OOB samples, since we won't analyze them until later, and make our Table 1 data.
+
+gcm_in_basin <- filter(good_creek_meta, in_basin=="yes")
+in_basins <- unique(gcm_in_basin$basin)
+lct_filt <- lct_filt["basin"=c(in_basins)] 
+lct_filt <- lct_filt["creek"=-"Fourth_Boulder"]
+
+
+#make final metadata for stuff that is in-range only, the stuff with the out-of-range samples, and the WWH/Alvord Lake samples. Also make final SNP metadata, which we will use along with these lists to filter the beagle file output by the same ANGSD call that produced our .geno raw input, which we use as the input for ngsadmix.
+good_sample_meta_ib <- sample.meta(lct_filt)
+good_sample_meta_both <- sample.meta(lct_filt_allbasins)
+good_sample_meta_oob_and_ct <- good_sample_meta_both %>% filter(in_basin=="no" | basin=="Carson" | basin=="Tahoe")
+good_sample_meta_oob_and_ct <- good_sample_meta_oob_and_ct %>% filter(basin!="Alvord_Lake_OOB")
+
+good_creek_meta_ib <- good_sample_meta_ib %>% group_by(basin,creek,year,creek_year,lat,long,in_will,in_basin,will_name,will_ho,will_pi,will_fis,ws_will,ts_will,PVA_Extinction,PVA_Ext_L95,PVA_Ext_U95,PVA_Abundance_50,PVA_Abundance_25,PVA_Abund_Year) %>% summarise("N"=n())
+good_creek_meta_ib$year  <- as.integer(good_creek_meta_ib$year)
+gsm_all <- sample.meta(lct_filt_allbasins)
+gbs_n_table <- gsm_all %>% group_by(basin) %>% summarise(N=n())
+gbm_all_table <- gsm_all %>% group_by(basin, in_basin) %>% summarise(sampling_locations=n_distinct(creek),populations=n_distinct(creek_year),samples=n())
+
+#write_delim(gbm_all_table,"~/lct/supp_mq25_m005/table_1_unformatted.txt",delim="\t",quote="none")
+
+wwh_oob_table <- wwh_oob_sample_meta %>% group_by(basin, in_basin) %>% summarise(sampling_locations=n_distinct(creek),populations=n_distinct(creek_year),samples=n())
+
+
+```
+
+
+```{r in_basin}
+
+#get our colors going
+basin_palette <- c("#E63946",  "#008000", "#00C49A","#56B4E9", "#0072B2","#006D77", "#FF1493","#9D2A2A","wheat","orange3","khaki1","#CC79A7", "#8E44AD", "#4D4D4D")
+humb_subbasin_palette <- c("coral2","coral4","wheat2","plum2","wheat4","plum4")
+
+
+#calculate he and format nicely. Almost all of this is formatting.
+lct_he1 <- calc_he(lct_filt, "creek.year")
+lct_filt_he_stats <- get.snpR.stats(lct_he1, "creek.year", stats=c("he"))
+lct_he <- lct_filt_he_stats$weighted.means
+lct_he$creek <- str_split_fixed(lct_he$subfacet,pattern="\\.",2)[,1]
+lct_he$year <- str_split_fixed(lct_he$subfacet,pattern="\\.",2)[,2]
+lct_he <- data.frame("creek"=lct_he$creek, "year"=as.integer(lct_he$year), "he"=lct_he$weighted_mean_he)
+lct_he <- right_join(good_creek_meta,lct_he,by=c("creek","year"))
+lct_he2 <- lct_he
+lct_he2$creek[lct_he2$creek=="SF_Little_Humboldt_tributary"] <- "SF_Little_Humb_Trib" 
+lct_he2$newcreek = str_wrap(lct_he2$creek, width = 20)
+lct_he2$newcreek <- gsub('_',' ',lct_he2$newcreek)
+lct_he2$newcreek <- reorder(lct_he2$newcreek,lct_he2$he,FUN=mean)
+lct_he2$basin <- gsub('_',' ',lct_he2$basin)
+lct_he2$creek_year <- paste0(lct_he2$newcreek, "<br><span style='font-size:10pt;'>", lct_he2$year, "</span>")
+
+#these year labels are for ggplot to help plot different years of the same population with only one population label
+year_labels <- lct_he2 %>% group_by(newcreek, basin) %>% summarise(years = n_distinct(year), .groups = "drop") %>% filter(years > 1) %>% left_join(distinct(lct_he2, newcreek, year, basin), by = c("newcreek", "basin"))
+
+ggplot(lct_he2, aes(x = newcreek, y = he, group = year, fill = basin)) + geom_point(size = 2.5, stroke = 0.6, shape = 21, position = position_dodge(width = 0.6)) + geom_hline(yintercept = 0.155, color = "coral2") + geom_text(data = year_labels, aes(x = newcreek, y = -0.02, label = year), position = position_dodge(width = 1), angle = 90, vjust = 0.5, hjust = 1.3, size = 2, family="PTSerif-Regular") + labs(title=expression(paste("Expected Heterozygosity (", italic(H)[E], ") Among LCT Basins")), x="Population", y= expression(paste("Expected Heterozygosity, ", italic(H)[E]))) + facet_wrap(~basin, scales = "free_x",nrow=3) +
+  fill_palette(palette = basin_palette) +
+  scale_x_discrete(labels = function(newcreek) str_wrap(newcreek, width = 20)) + theme_bw() + theme(legend.position = "none",axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1, margin = margin(t = 12),family="PTSerif-Regular",size=11)) + coord_cartesian(clip = "off") + theme(plot.margin = margin(10, 10, 30, 10)) + theme(text=element_text(family="PTSerif-Bold"),strip.text.x=element_text(size=11,face = "bold",family="PTSerif-Bold"))
+
+#save as both svg and png
+#ggsave("~/lct/lct_14k_overall_he_basin.svg",device=svglite)
+#ggsave("~/lct/lct_14k_overall_he_basin.png",device="png",height=10,width=11,dpi=250)
+
+
+
+#pi, fis, ho, and thetas
+
+##the thetas take a long time, so I usually only run it once and then load it if I need to run this script again. 
+
+#lct_tjd1 <- calc_tajimas_d(lct_filt,facets="creek.year.chromo",sigma=100,step=75)
+
+#thetas <- get.snpR.stats(lct_tjd1, "creek.year.chromo", stats="tajimas_d")
+#creek_thetas <- filter(thetas$weighted.means,snp.subfacet==".OVERALL_MEAN")
+
+#creek_thetas$creek <- str_split_fixed(creek_thetas$subfacet,pattern="\\.",2)[,1]
+#creek_thetas$year <- str_split_fixed(creek_thetas$subfacet,pattern="\\.",2)[,2]
+#creek_thetas <- data.frame("creek"=creek_thetas$creek,"year"=as.integer(creek_thetas$year), "ws_theta"=(creek_thetas$weighted_mean_ws.theta/nsnps(lct_filt)),"ts_theta"=(creek_thetas$weighted_mean_ts.theta/nsnps(lct_filt)))
+##write_delim(creek_thetas,"~/lct/lct_14k_creek_thetas.txt",delim="\t",quote="none")
+
+creek_thetas <- read.delim("~/lct/lct_14k_creek_thetas.txt")
+
+lct_pifis <- calc_pi(lct_filt,facets="creek.year")
+lct_pifis <- calc_fis(lct_pifis,facets="creek.year")
+lct_pifis <- calc_ho(lct_pifis,facets="creek.year")
+lct_filt_pifis_stats <- get.snpR.stats(lct_pifis, "creek.year", stats=c("pi","fis","ho"))
+lct_pifis <- lct_filt_pifis_stats$weighted.means
+lct_pifis$creek <- str_split_fixed(lct_pifis$subfacet,pattern="\\.",2)[,1]
+lct_pifis$year <- str_split_fixed(lct_pifis$subfacet,pattern="\\.",2)[,2]
+lct_pifis <- data.frame("creek"=lct_pifis$creek,"year"=as.integer(lct_pifis$year),"pi"=lct_pifis$weighted_mean_pi, "fis"=lct_pifis$weighted_mean_fis,"ho"=lct_pifis$weighted_mean_ho)
+lct_all <- left_join(lct_he,lct_pifis,by=c("creek","year"))
+
+lct_all <- left_join(lct_all, creek_thetas,by=c("creek","year"))
+lct_all$creek[lct_all$creek=="SF_Little_Humboldt_tributary"] <- "SF_Little_Humb_Trib"
+lct_all$newcreek = str_wrap(lct_all$creek, width = 16)
+lct_all$newcreek <- gsub('_',' ',lct_all$newcreek)
+lct_all$newcreek <- reorder(lct_all$newcreek,lct_all$he,FUN=mean)
+lct_all$basin <- gsub('_',' ',lct_all$basin)
+
+year_labels <- lct_all %>% group_by(newcreek, basin) %>% summarise(years = n_distinct(year), .groups = "drop") %>% filter(years > 1) %>% left_join(distinct(lct_he2, newcreek, year, basin), by = c("newcreek", "basin"))
+
+##plotting supplemental figures 1-4
+ggplot(lct_all, aes(x = newcreek, y = pi, group = year, fill = basin)) + geom_point(size = 3, stroke = 0.6, shape = 21, position = position_dodge(width = 0.6)) + geom_hline(yintercept = mean(lct_all$pi), color = "coral2") + theme_bw() + geom_text(data = year_labels, aes(x = newcreek, y = -0.2, label = year), position = position_dodge(width = 1), angle = 90, vjust = 0.5, hjust = 1.3, size = 1.85) + labs(title=expression(paste(pi, " Among LCT Basins")),x="Population", y=expression(pi)) + facet_wrap(~basin, scales = "free_x",nrow=3) +
+  fill_palette(palette = basin_palette) +
+  scale_x_discrete(labels = function(newcreek) str_wrap(newcreek, width = 20)) + theme(legend.position = "none",axis.text.x = element_text(angle = 90, vjust = 0.5,margin = margin(t = 12))) + coord_cartesian(clip = "off") + theme(plot.margin = margin(10, 10, 30, 10)) + theme(text=element_text(family="PTSerif-Regular"), strip.text.x=element_text(family="PTSerif-Bold"))
+#ggsave("~/lct/lct_14k_all_pi_basin.svg",device=svglite)
+#ggsave("~/lct/lct_14k_all_pi_basin.png",device="png",height=10,width=11,dpi=250)
+
+ggplot(lct_all, aes(x = newcreek, y = fis, group = year, fill = basin)) + geom_point(size = 3, stroke = 0.6, shape = 21, position = position_dodge(width = 0.6)) + theme_bw() + geom_hline(yintercept = mean(lct_all$fis), color = "coral2") + geom_text(data = year_labels, aes(x = newcreek, y = -0.7, label = year), position = position_dodge(width = 1), angle = 90, vjust = 0.5, hjust = 1.3, size = 1.85) + labs(title=expression(paste("Inbreeding Coefficient (",italic(F)[IS],") Among LCT Basins")),x="Population",y=expression(paste("Inbreeding Coefficient (",italic(F)[IS],")"))) + facet_wrap(~basin, scales = "free_x",nrow=3) +
+  fill_palette(palette = basin_palette) +
+  scale_x_discrete(labels = function(newcreek) str_wrap(newcreek, width = 20)) + theme(legend.position = "none",axis.text.x = element_text(angle = 90, vjust = 0.5,margin = margin(t = 12))) + coord_cartesian(clip = "off") + theme(plot.margin = margin(10, 10, 30, 10)) + theme(text=element_text(family="PTSerif-Regular"), strip.text.x=element_text(family="PTSerif-Bold"))
+#ggsave("~/lct/lct_14k_all_fis_basin.svg",device=svglite)
+#ggsave("~/lct/lct_14k_all_fis_basin.png",device="png",height=10,width=11,dpi=250)
+
+ggplot(lct_all, aes(x = newcreek, y = ws_theta, group = year, fill = basin)) + geom_point(size = 3, stroke = 0.6, shape = 21, position = position_dodge(width = 0.6)) + geom_hline(yintercept = mean(lct_all$ws_theta), color = "coral2") + theme_bw() + geom_text(data = year_labels, aes(x = newcreek, y = 0, label = year), position = position_dodge(width = 1), angle = 90, vjust = 0.5, hjust = 1.3, size = 1.85) + labs(title=expression(paste("Watterson's Theta (",italic(Theta)[w], ") Among LCT Basins")),x="Population",y=expression(paste("Watterson's Theta (",italic(theta)[w], ")"))) + facet_wrap(~basin, scales = "free_x",nrow=3) +
+  fill_palette(palette = basin_palette) +
+  scale_x_discrete(labels = function(newcreek) str_wrap(newcreek, width = 20)) + theme(legend.position = "none",axis.text.x = element_text(angle = 90, vjust = 0.5,margin = margin(t = 12))) + coord_cartesian(clip = "off") + theme(plot.margin = margin(10, 10, 30, 10)) + theme(text=element_text(family="PTSerif-Regular"), strip.text.x=element_text(family="PTSerif-Bold"))
+#ggsave("~/lct/lct_14k_all_ws_theta_basin.svg",device=svglite)
+#ggsave("~/lct/lct_14k_all_ws_theta_basin.png",device="png",height=10,width=11,dpi=250)
+
+ggplot(lct_all, aes(x = newcreek, y = ts_theta, group = year, fill = basin)) + geom_point(size = 3, stroke = 0.6, shape = 21, position = position_dodge(width = 0.6)) + geom_hline(yintercept = mean(lct_all$ts_theta), color = "coral2") + theme_bw() + geom_text(data = year_labels, aes(x = newcreek, y = 0, label = year), position = position_dodge(width = 1), angle = 90, vjust = 0.5, hjust = 1.3, size = 1.85) + labs(title=expression(paste("Tajima's Theta (", italic(Theta)[pi], ") Among LCT Basins")),x="Population",y=expression(paste("Tajima's Theta (", italic(Theta)[pi], ")"))) + facet_wrap(~basin, scales = "free_x",nrow=3) + fill_palette(palette = basin_palette) + scale_x_discrete(labels = function(newcreek) str_wrap(newcreek, width = 20)) + theme(legend.position = "none",axis.text.x = element_text(angle = 90, vjust = 0.5,margin = margin(t = 12))) + coord_cartesian(clip = "off") + theme(plot.margin = margin(10, 10, 30, 10)) + theme(text=element_text(family="PTSerif-Regular"), strip.text.x=element_text(family="PTSerif-Bold"))
+
+#ggsave("~/lct/lct_10k_all_ts_theta_basin.svg",device=svglite)
+#ggsave("~/lct/lct_14k_all_ts_theta_basin.png",device="png",height=10,width=11,dpi=250)
+
+
+
+#ANOVA 
+anov <- aov(he~basin,data=lct_all)
+hsd <- TukeyHSD(anov)
+hsd <- as.data.frame(hsd$basin)
+hsd$pop <- row.names(hsd)
+#write_delim(hsd,"~/lct/lct_14k_tukeyhsd_results_basin.txt",delim="\t",quote="none")
+
+
+##PCA and Fst
+q <- plot_clusters(lct_filt, facets = c("basin"))
+b <- q$data$pca
+b$basin <- gsub('_',' ',b$basin)
+colnames(b)[colnames(b) == "basin"] <- "Basin"
+
+
+
+
+plot1 <- ggplot(b, aes(PC1, PC2, fill=Basin)) + geom_point(shape=21,size=5,stroke=0.8) + theme_bw() + theme(text=element_text(size=18,family="PTSerif-Bold"),legend.position="none",legend.text = element_text(size=16,family="PTSerif-Bold")) +xlab(paste0("PC1 (",q$pca_loadings[[1]],"%)")) + ylab(paste0("PC2 (",q$pca_loadings[[2]],"%)"))  + theme(legend.position="none") + fill_palette(palette=basin_palette) + ggtitle("PCA for LCT Populations, PC1-PC2")
+
+
+plot2 <- ggplot(b, aes(PC1, PC3, fill=Basin)) + geom_point(shape=21,size=5,stroke=0.8)  + theme_bw() + theme(text=element_text(size=18,family="PTSerif-Bold"),legend.position="none",legend.text = element_text(size=16,family="PTSerif-Bold")) +xlab(paste0("PC1 (",q$pca_loadings[[1]],"%)")) + ylab(paste0("PC3 (",q$pca_loadings[[3]],"%)")) + theme(legend.position="none") + fill_palette(palette=basin_palette) + ggtitle("PC1-PC3")
+
+
+arranged_plots <- ggarrange(plot1, plot2,
+                            labels = c("a)", "b)"),
+                            ncol = 2, nrow = 1,
+                            common.legend = TRUE,
+                            legend = "top",font.label = list(size=18,family = "serif"))
+
+print(arranged_plots)
+##ggsave("~/lct/lct_14k_pca_plots.svg",device=svglite)
+#ggsave("~/lct/lct_14k_pca_plots.png",device="png",height=12,width=18,dpi=250)
+
+#ggsave("lct_10k_pca_pc1_pc3_basin.png",device="png",dpi=200) 
+
+#ggsave("lct_10k_pca_pc1_pc2_basin.png",device="png",dpi=200)
+
+
+#Fst
+basin.fst <- calc_pairwise_fst(lct_filt,facets="basin")
+basin_fst_stats <- get.snpR.stats(basin.fst,facets="basin",stats="fst")
+basin_fst <- basin_fst_stats$weighted.means
+basin_fst$X <- str_split_fixed(basin_fst$subfacet,"~",2)[,1]
+basin_fst$Y <- str_split_fixed(basin_fst$subfacet,"~",2)[,2]
+colnames(basin_fst) <- c("facet","subfacet","snp.facet","snp.subfacet","Fst","mean_fst","X","Y")
+basin_fst$newX = str_wrap(basin_fst$X, width = 16)
+basin_fst$newY = str_wrap(basin_fst$Y, width = 16)
+basin_fst$newX <- gsub('_',' ',basin_fst$newX)
+basin_fst$newY <- gsub('_',' ',basin_fst$newY)
+basin_fst %>% ggplot(aes(newX,newY,fill=Fst)) + geom_tile() + scale_x_discrete(labels = function(newX) str_wrap(newX, width = 16)) + scale_y_discrete(labels = function(newY) str_wrap(newY, width = 16))+coord_fixed() + geom_shadowtext(aes(label = round(Fst,2)),color="white",size=6.2,family="PTSerif-Bold") + theme_bw() + theme(text=element_text(size=20,family="PTSerif-Bold")) + theme(axis.text.x=element_text(angle = 90, vjust = 0.5, hjust=1,size=20),axis.text.y = element_text(size=20,family="PTSerif-Bold")) + xlab("") + ylab("") + scale_fill_scico(palette="batlow")
+
+#ggsave("~/lct/lct_14k_basin_fst.png",device="png", height=10,width=11,dpi=250)
+#ggsave("~/lct/lct_14k_basin_fst.svg",device="svg")
+
+
+
+ ##fst within each basin, arranged
+
+for(i in 1:length(in_basins)) {
+  lct_temp <- lct_filt["basin"=in_basins[i]]
+  creeks <- length(unique(sample.meta(lct_temp)$creek))
+  if(creeks > 1) {
+    basin.fst <- calc_pairwise_fst(lct_temp,facets="creek")
+    basin_fst_stats <- get.snpR.stats(basin.fst,facets="creek",stats="fst")
+    basin_fst <- basin_fst_stats$weighted.means
+    basin_fst$X <- str_split_fixed(basin_fst$subfacet,"~",2)[,1]
+    basin_fst$Y <- str_split_fixed(basin_fst$subfacet,"~",2)[,2]
+    colnames(basin_fst) <- c("facet","subfacet","snp.facet","snp.subfacet","Fst","mean_fst","X","Y")
+    basin_fst$newX = str_wrap(basin_fst$X, width = 12)
+    basin_fst$newY = str_wrap(basin_fst$Y, width = 12)
+    basin_fst$newX[basin_fst$newX=="SF_Little_Humboldt_tributary"] <- "SF_Little_Humb_Trib" 
+    basin_fst$newY[basin_fst$newY=="SF_Little_Humboldt_tributary"] <- "SF_Little_Humb_Trib" 
+     basin_fst$newX[basin_fst$newX=="SF_Little_Humboldt"] <- "SF_Little_Humb" 
+    basin_fst$newY[basin_fst$newY=="SF_Little_Humboldt"] <- "SF_Little_Humb" 
+     basin_fst$newX[basin_fst$newX=="Up_Truckee"] <- "Upper_Truckee" 
+    basin_fst$newY[basin_fst$newY=="Up_Truckee"] <- "Upper_Truckee" 
+    basin_fst$newX <- gsub('_',' ',basin_fst$newX)
+    basin_fst$newY <- gsub('_',' ',basin_fst$newY)
+    nam <- gsub("_"," ",in_basins[i])
+    #this creates a plot that hopefully is readable
+    temp_plot <- basin_fst %>% ggplot(aes(newX,newY,fill=Fst,label=format(round(Fst,2), nsmall = 2))) + geom_tile() + scale_x_discrete(labels = function(newX) str_wrap(newX, width = 12)) + scale_y_discrete(labels = function(newY) str_wrap(newY, width = 12))+coord_fixed() + geom_fit_text(contrast=TRUE,family="PTSerif-Bold",grow=TRUE) + theme_bw() + theme(axis.text.x=element_text(angle = 90, vjust = 0.5, hjust=1),legend.position = "none") + xlab("") + ylab("") + scale_fill_gradientn(limits=c(0,0.58), colors=scico(6, palette = 'batlowW'),values=scales::rescale(c(0,0.05,0.15,0.25,0.58))) + ggtitle(nam) + theme(text=element_text(size=18,family="PTSerif-Bold")) 
+    assign(paste0("fst_plot_",i),temp_plot)
+  }
+}
+
+#table with the pairwise values for just the N=2 basins, since those produce stupid Fst plots (just a single square)
+lct_14k_n2_fst_table <- read.delim("~/lct/lct_14k_n2_fst_table.txt")
+colnames(lct_14k_n2_fst_table)[colnames(lct_14k_n2_fst_table)=="Pairwise.FST"] <- "italic(F)[ST]"
+
+tg <- tableGrob(lct_14k_n2_fst_table,rows=NULL,theme = ttheme_gtsimple(base_family = "serif",base_size=28,parse = TRUE))
+
+fst_table_left <- grobTree(
+  tg,
+  vp = viewport(
+    x = 0, y = 0.5,
+    just = c("left", "center"),
+    width = 1, height = 1
+  )
+)
+
+fst_table_n2 <- as_ggplot(fst_table_left)
+
+
+top9 <- ggarrange(
+  fst_plot_1, fst_plot_2, fst_plot_4,
+  fst_plot_5, fst_plot_6, fst_plot_9,
+  fst_plot_10, fst_plot_13, fst_plot_14,
+  labels = c("a)", "b)", "c)", "d)", "e)", "f)", "g)", "h)", "i)"),
+  font.label = list(size=18,family = "serif"),
+  ncol = 3, nrow = 3
+)
+
+bottom <- ggarrange(
+  fst_table_n2,
+  labels = "j)",
+  font.label = list(size=18,family = "serif"),
+  ncol = 1, hjust=0
+)
+
+arranged_plots_fst <- ggarrange(
+  top9, bottom,
+  ncol = 1, nrow = 2,
+  heights = c(3, 0.8), align="h") + bgcolor("white")
+
+print(arranged_plots_fst)
+
+#ggsave("~/lct/test_fst_only.png",device="png",height=21,width=27,dpi=250)
+
+#ggsave("~/lct/lct_14k_fst_basin_plots_gt2_only.png",device="png",height=19,width=25,dpi=250)
+
+##creek-level Fst, only used to calculate significance of within vs between basin differences.
+creek.fst <- calc_pairwise_fst(lct_filt,facets="creek")
+creek_fst_stats <- get.snpR.stats(creek.fst,facets="creek",stats="fst")
+creek_fst <- creek_fst_stats$weighted.means
+creek_fst$creek <- str_split_fixed(creek_fst$subfacet,"~",2)[,1]
+creek_fst$basinA <- good_sample_meta_ib$basin[match(creek_fst$creek, good_sample_meta_ib$creek)]
+creek_fst$X <- str_split_fixed(creek_fst$subfacet,"~",2)[,1]
+creek_fst$creek <- str_split_fixed(creek_fst$subfacet,"~",2)[,2]
+creek_fst$basinB <- good_sample_meta_ib$basin[match(creek_fst$creek, good_sample_meta_ib$creek)]
+creek_fst$Y <- str_split_fixed(creek_fst$subfacet,"~",2)[,2]
+
+basin_within <- filter(creek_fst, basinA==basinB)
+basin_between <- filter(creek_fst, basinA!=basinB)
+wilcox.test(basin_within$weighted_mean_fst,basin_between$weighted_mean_fst)
+mean(basin_within$weighted_mean_fst)
+mean(filter(creek_fst,basinA=="Reese" & basinB=="Reese")$weighted_mean_fst)
+
+##AMOVA
+
+#output SNPs in adegenet format
+adg <- format_snps(lct_filt, "adegenet", facets = "basin.creek.year")
+
+#make a sample metadata table for adegenet
+strata_adg <- paste0(sample.meta(lct_filt)$basin,"_",sample.meta(lct_filt)$creek,"_",sample.meta(lct_filt)$year)
+
+#testing a second method with fewer metadata layers
+adg <- format_snps(lct_filt, "adegenet", facets = "creek")
+
+strata_adg <- data.frame("basin"=sample.meta(lct_filt)$basin,"creek"=sample.meta(lct_filt)$creek,"year"=sample.meta(lct_filt)$year,"sample"=sample.meta(lct_filt)$sample)
+strata(adg) <- NULL
+strata(adg) <- strata_adg
+adg_amova <- poppr.amova(adg, ~basin/creek, cutoff=0.5, missing="ignore",within=FALSE)
+adg_amova2 <- poppr.amova(adg, ~basin/creek/sample, cutoff=0.5, missing="ignore",within=FALSE)
+adg_amova3 <- poppr.amova(adg, ~basin/creek/year, cutoff=0.5, missing="ignore",within=FALSE)
+
+
+adg_signif <- randtest(adg_amova3, nrepet=999)
+
+
+```
+
+```{r humb}
+
+##just a few supplementals where I look at sub-basin-level differences within the humboldt 
+###Humboldt Sub-Basin Assessments##
+
+#he
+lct_humb <- lct_all %>% filter(grepl("Humboldt", basin))
+lct_humb$subbasin <- str_split_fixed(lct_humb$basin,pattern="\\/",2)[,2]
+lct_humb$subbasin[lct_humb$subbasin=="NF"] <- "North Fork"
+lct_humb$subbasin[lct_humb$subbasin=="SF"] <- "South Fork"
+humb_year_labels <- lct_humb %>% group_by(newcreek, subbasin) %>% summarise(years = n_distinct(year), .groups = "drop") %>% filter(years > 1) %>% left_join(distinct(lct_humb, newcreek, year, subbasin), by = c("newcreek", "subbasin"))
+
+ggplot(lct_humb, aes(x = newcreek, y = he, group = year, fill = subbasin)) + geom_point(size = 2, stroke = 0.6, shape = 21, position = position_dodge(width = 0.6)) + geom_hline(yintercept = mean(lct_all$he), color = "coral2") + geom_text(data = humb_year_labels, aes(x = newcreek, y = -0.2, label = year), position = position_dodge(width = 1), angle = 90, vjust = 0.5, hjust = 1.3, size = 1.85) + xlab("Population") + ylab(expression(paste(italic(H)[e]))) + facet_wrap(~subbasin, scales = "free_x",nrow=3) +
+  fill_palette(palette = humb_subbasin_palette) +
+  scale_x_discrete(labels = function(newcreek) str_wrap(newcreek, width = 20)) + theme(legend.position = "none",axis.text.x = element_text(angle = 90, vjust = 0.5,margin = margin(t = 16))) + labs(title=expression(paste("Expected Heterozygosity (",italic(H)[e], ") Among Humboldt Sub-Basins"))) + coord_cartesian(clip = "off") + theme(plot.margin = margin(10, 10, 30, 10)) +theme(text=element_text(family="PTSerif-Regular"),strip.text.x=element_text(family="PTSerif-Bold"))
+#ggsave("~/lct/lct_14k_humb_subbasin_he.svg",device=svglite)
+#ggsave("~/lct/lct_14k_humb_subbasin_he.png",device="png",height=10,width=11,dpi=250)
+
+humb_sub_means <- lct_humb %>% group_by(subbasin) %>% summarise(mean_he=mean(he))
+
+#write_delim(humb_sub_means,"humboldt_sub_he_means.txt",quote="none",delim="\t")
+
+humb_subs <- unique(lct_humb$basin)
+lct_humb2 <- lct_filt["watershed"="Humboldt"]
+lct_humb_meta <- sample.meta(lct_humb2)
+
+q <- plot_clusters(lct_humb2, facets = c("subbasin"))
+b <- q$data$pca
+colnames(b)[colnames(b)=="subbasin"] <- "Subbasin"
+
+ggplot(b, aes(PC1, PC2, fill=Subbasin)) + geom_point(shape=21,size=4,stroke=0.6) + theme_bw() + theme(text=element_text(size=14,family="PTSerif-Regular"),legend.position="none",legend.text = element_text(size=12,family="PTSerif-Regular")) +xlab(paste0("PC1 (",q$pca_loadings[[1]],"%)")) + ylab(paste0("PC2 (",q$pca_loadings[[2]],"%)"))  + theme(legend.position="top") + fill_palette(palette=basin_palette) + ggtitle("PCA for LCT Populations in the Humboldt Basin, PC1-PC2")
+
+#ggsave("~/lct/lct_14k_humb_PCA_PC1_PC2.png",device="png",height=10,width=11,dpi=250)
+
+
+#Fst. TBH are only using this to look at whether within/among subbasin Fst is higher - we've already done within-subbasin 
+humb.fst <- calc_pairwise_fst(lct_humb2,facets="creek")
+humb_fst_stats <- get.snpR.stats(humb.fst,facets="creek",stats="fst")
+humb_fst <- humb_fst_stats$weighted.means
+humb_fst$creek <- str_split_fixed(humb_fst$subfacet,"~",2)[,1]
+humb_fst$subA <- lct_humb_meta$subbasin[match(humb_fst$creek, lct_humb_meta$creek)]
+humb_fst$X <- str_split_fixed(humb_fst$subfacet,"~",2)[,1]
+humb_fst$creek <- str_split_fixed(humb_fst$subfacet,"~",2)[,2]
+humb_fst$subB <- lct_humb_meta$subbasin[match(humb_fst$creek, lct_humb_meta$creek)]
+humb_fst$Y <- str_split_fixed(humb_fst$subfacet,"~",2)[,2]
+
+
+
+humb_within <- filter(humb_fst, subA==subB)
+humb_between <- filter(humb_fst, subA!=subB)
+humb_wilcox <- wilcox.test(humb_within$weighted_mean_fst,humb_between$weighted_mean_fst)
+mean(humb_between$weighted_mean_fst)
+
+adg_humb <- format_snps(lct_humb2, "adegenet", facets = "creek")
+strata_adg_humb <- data.frame("subbasin"=sample.meta(lct_humb2)$subbasin,"creek"=sample.meta(lct_humb2)$creek,"year"=sample.meta(lct_humb2)$year,"sample"=sample.meta(lct_humb2)$sample)
+strata(adg_humb) <- NULL
+strata(adg_humb) <- strata_adg_humb
+adg_amova_humb <- poppr.amova(adg_humb, ~subbasin/creek/year, cutoff=0.5, missing="ignore",within=FALSE)
+
+adg_signif_humb <- randtest(adg_amova_humb, nrepet=999)
+
+```
+
+```{r willcomp}
+
+##comparing our results to Hemstrom et al. (2022). All Hemstrom numbers are taken from the supplemental tables found at https://github.com/hemstrow/N_H_etal_LCT for the same populations.
+
+#we will analyze both at the population level (sampling location + year) and the basin level, to see if higher-level assessments are more tightly correlated. So here we filter to include only the stuff shared between both studies, then we group the data by basin, using median values. I did run this with mean values too, correlations did not change.
+
+lct_withw <- filter(lct_all,in_will=="YES")
+
+#pivot longer to make these stats facet wrap nicely
+
+
+lct_l1 <- pivot_longer(lct_withw, cols=c(24:29),names_to="stat",values_to="vals_ours")
+lct_l2 <- pivot_longer(lct_withw, cols=c(10:14),names_to="stat",values_to="vals_wills")
+lct_l2$stat[lct_l2$stat=="will_ho"] <- "ho"
+lct_l2$stat[lct_l2$stat=="will_pi"] <- "pi"
+lct_l2$stat[lct_l2$stat=="will_fis"] <- "fis"
+lct_l2$stat[lct_l2$stat=="ts_will"] <- "ts_theta"
+lct_l2$stat[lct_l2$stat=="ws_will"] <- "ws_theta"
+
+
+lct_ww_facet <- inner_join(lct_l1,lct_l2,by=c("basin","creek","year","creek_year","lat","long","in_will","in_basin","will_name","N","perc_missing","seg_sites","newcreek","PVA_Extinction","PVA_Ext_L95","PVA_Ext_U95","PVA_Abundance_50","PVA_Abundance_25","PVA_Abund_Year","stat"))
+
+lct_ww_facet$stat[lct_ww_facet$stat=="pi"] <- "italic(pi)"
+lct_ww_facet$stat[lct_ww_facet$stat=="fis"] <- "italic(F)[is]"
+lct_ww_facet$stat[lct_ww_facet$stat=="ho"] <- "italic(H)[o]"
+lct_ww_facet$stat[lct_ww_facet$stat=="ws_theta"] <- "italic(Theta)[w]"
+lct_ww_facet$stat[lct_ww_facet$stat=="ts_theta"] <- "italic(Theta)[pi]"
+
+colnames(lct_ww_facet)[colnames(lct_ww_facet) == "basin"] <- "Basin"
+
+ggplot(lct_ww_facet, aes(x=vals_ours,y=vals_wills)) + geom_point(aes(fill=Basin),shape=21,size=5)  + facet_wrap(~ stat, labeller = label_parsed, scales="free")  + geom_smooth(method="lm") + theme_bw() +stat_cor(method="pearson",size=6,family="PTSerif-Bold") + labs(title=paste("Comparison Among Populations Analyzed by Hemstrom et al., (2022) and This Study"),x=paste("Genetic Estimates, This Study"),y=paste("Genetic Estimates, Hemstrom et al., (2022)")) + theme(text=element_text(size=14,family="PTSerif-Regular"),legend.position="bottom") +fill_palette(palette=basin_palette)
+
+
+#ggsave("~/lct/lct_14k_will_comps_facet.svg",device=svglite)
+#ggsave("~/lct/lct_14k_will_comps_facet.png",device="png",height=10,width=12,dpi=250)
+
+
+##redo grouped at the basin level, using median values
+grouped_lct <- filter(lct_all,in_will=="YES")
+grouped_lct$basin <- gsub("_"," ",grouped_lct$basin)
+grouped_lct <- grouped_lct %>% group_by(basin) %>% summarise(ho=median(ho),will_ho=median(will_ho),pi=median(pi),will_pi=median(will_pi),ts_theta=median(ts_theta),ts_will=median(ts_will),ws_theta=median(ws_theta),ws_will=median(ws_will),fis=median(fis),will_fis=median(will_fis))
+
+#grouped_lct <- grouped_lct %>% group_by(basin) %>% summarise(ho=mean(ho),will_ho=mean(will_ho),pi=mean(pi),will_pi=mean(will_pi),ts_theta=mean(ts_theta),ts_will=mean(ts_will),ws_theta=mean(ws_theta),ws_will=mean(ws_will),fis=mean(fis),will_fis=mean(will_fis))
+
+grouped_lct_l1 <- pivot_longer(grouped_lct, cols=c(2,4,6,8,10),names_to="stat",values_to="vals_ours")
+grouped_lct_l2 <- pivot_longer(grouped_lct, cols=c(3,5,7,9,11),names_to="stat",values_to="vals_wills")
+grouped_lct_l2$stat[grouped_lct_l2$stat=="will_ho"] <- "ho"
+grouped_lct_l2$stat[grouped_lct_l2$stat=="will_pi"] <- "pi"
+grouped_lct_l2$stat[grouped_lct_l2$stat=="will_fis"] <- "fis"
+grouped_lct_l2$stat[grouped_lct_l2$stat=="ts_will"] <- "ts_theta"
+grouped_lct_l2$stat[grouped_lct_l2$stat=="ws_will"] <- "ws_theta"
+
+
+lct_grouped_facet <- inner_join(grouped_lct_l1,grouped_lct_l2,by=c("basin","stat"))
+
+lct_grouped_facet$stat[lct_grouped_facet$stat=="pi"] <- "italic(pi)"
+lct_grouped_facet$stat[lct_grouped_facet$stat=="fis"] <- "italic(F)[is]"
+lct_grouped_facet$stat[lct_grouped_facet$stat=="ho"] <- "italic(H)[o]"
+lct_grouped_facet$stat[lct_grouped_facet$stat=="ws_theta"] <- "italic(Theta)[w]"
+lct_grouped_facet$stat[lct_grouped_facet$stat=="ts_theta"] <- "italic(Theta)[pi]"
+
+colnames(lct_grouped_facet)[colnames(lct_grouped_facet) == "basin"] <- "Basin"
+
+ggplot(lct_grouped_facet, aes(x=vals_ours,y=vals_wills)) + geom_point(aes(fill=Basin),shape=21,size=5)  + facet_wrap(~ stat, labeller = label_parsed, scales="free")  + geom_smooth(method="lm") + theme_bw() +stat_cor(method="pearson",size=5,family="PTSerif-Bold") + labs(title=paste("Comparison Among Basins Analyzed by Hemstrom et al., (2022) and This Study, Median Values"),x=paste("Genetic Estimates, This Study"),y=paste("Genetic Estimates, Hemstrom et al., (2022)")) + theme(text=element_text(size=14,family="PTSerif-Regular"),legend.position="bottom") +fill_palette(palette=basin_palette)
+
+#ggsave("~/lct/lct_14k_will_comps_facet_basin.svg",device=svglite)
+#ggsave("~/lct/lct_14k_will_comps_facet_basin.png",device="png",height=10,width=11,dpi=250)
+
+
+plot_mpva_1 <- ggplot(lct_ww_facet, aes(y = log10(PVA_Abundance_50), x = vals_ours)) + geom_smooth(method="lm")+ facet_wrap(~ stat, scales = "free_x", strip.position = "top",labeller = label_parsed) + geom_point(aes(fill=Basin),shape=21,size=5) + theme_bw() + stat_cor(method="pearson",size=6,family="Times") +labs(title=paste("Correlation Between MPVA Indices (Neville et al. 2020) and Genetic Estimates"),x=paste("Genetic Estimates, This Study"), y=expression(paste(italic(log)[10],"(MPVA Abundance Index), Neville et al. (2020)")),parse=TRUE)  + theme(text=element_text(size=16,family="Times"),axis.text.x=element_text(size=12,angle = 90),strip.text.x = element_text(family="Times",face="bold" )) +fill_palette(palette=basin_palette)
+##ggsave("~/lct/lct_14k_PVA_Abundance50_statplot.png",device="png", height=10, width=11,dpi=250)
+
+plot_mpva_2 <- ggplot(lct_ww_facet, aes(y = log10(PVA_Extinction), x =vals_ours)) + geom_smooth(method="lm") + facet_wrap(~ stat, scales = "free", strip.position = "top",labeller = label_parsed) + geom_point(aes(fill=Basin),shape=21,size=4) + theme_bw() + stat_cor(method="pearson",size=6,family="Times")+ labs(x=paste("Genetic Estimates, This Study"), y=expression(paste(italic(log)[10],"(MPVA Extinction Index), Neville et al. (2020)"))) + theme(text=element_text(size=16,family="Times"),axis.text.x=element_text(size=12,angle = 90),strip.text.x = element_text(family="Times",face = "bold")) +fill_palette(palette=basin_palette)
+
+mpva_plots <- ggarrange(plot_mpva_1,plot_mpva_2,ncol=1,nrow=2,common.legend = TRUE,font.label = list(size=24,family="serif"),labels = c("a)","b)"))
+
+mpva_plots
+
+#ggsave("~/lct/lct_14k_mpva_statplots.png",device="png",height=18,width=11,dpi=250)
+
+
+
+```
+
+```{r beagle}
+
+#filter and re-organize the beagle file so that we can run three different subsets for admix: all, out-of-range + putative source pops only, WWH/Alvord Lake only
+
+#this is the beagle produced by my reshuffle_beagle.sh script. I usually keep all beagle files zipped, so unzip if needed first.
+unfilt_beagle <- read_tsv("~/lct/supp_mq25_m005/final_lct_supp_mq25_m005_all.beagle",name_repair = "minimal")
+
+#function to deal with filtering a file with duplicated names. 
+select_beagle_ids <- function(df, ids, keep_fixed = TRUE, strict = TRUE) {
+  hdr <- names(df)
+
+  fixed_idx <- integer(0)
+  if (keep_fixed) {
+    fixed_idx <- match(c("marker", "allele1", "allele2"), hdr)
+    if (anyNA(fixed_idx)) stop("Couldn't find one of: marker, allele1, allele2")
+  }
+
+  if (strict) {
+    missing <- setdiff(ids, hdr)
+    if (length(missing)) stop("IDs not found in header: ", paste(missing, collapse = ", "))
+  }
+
+  id_idx <- unlist(lapply(ids, function(id) which(hdr == id)), use.names = FALSE)
+  keep_idx <- c(fixed_idx, id_idx)
+
+  # Base subsetting: OK with duplicate column names
+  df[, keep_idx]
+}
+
+
+#these are the SNPs we kept, it's nearly all of them but about 40 got dropped when the rest of the samples were added to the discovery set because they became tri-allelic. 
+beagle_snp_list <- snp.meta(lct_filt)$chrom_pos
+#the beagle file uses "." for the end of a chromosome, which is an NCBI thing. We changed this earlier because snpR doesn't like ".", so we'll change it back so that it matches.
+beagle_snp_list <- gsub("_1_",".1_",beagle_snp_list)
+
+snp_filt_beagle <- unfilt_beagle[unfilt_beagle$marker %in% beagle_snp_list, ]
+
+
+
+#now we make our beagle that has all our in-basin samples that pass filters. We made that metadata earlier, it's called good_sample_meta_ib. I'm sorting it by basin
+
+samples_to_keep_ib_beagle <- arrange(good_sample_meta_ib,basin,creek,year)$sample
+samples_to_keep_ib_beagle <- c("marker","allele1","allele2",samples_to_keep_ib_beagle)
+ib_filt_beagle2 <- select_beagle_ids(snp_filt_beagle, samples_to_keep_ib_beagle)
+
+#now we make the beagle that has the out-of-range pops plus their potential sources in Carson and Tahoe basins. That metadata is called good_sample_meta_oob_and_ct
+samples_to_keep_oob_beagle <- arrange(good_sample_meta_oob_and_ct,basin,creek,year)$sample
+
+oob_filt_beagle2 <- select_beagle_ids(snp_filt_beagle, samples_to_keep_oob_beagle)
+
+#now WWH/Alvord Lake, which I did separately. That metadata is called wwh_oob_sample_meta
+samples_to_keep_wwh_oob_beagle <- arrange(wwh_oob_sample_meta,basin,creek,year)$sample
+
+wwh_oob_filt_beagle2 <- select_beagle_ids(snp_filt_beagle, samples_to_keep_wwh_oob_beagle)
+
+##write these. The column names will need to be edited before ngsadmix is run, there's a line for it in the ngsadmix script. R doesn't allow duplicate column names, and the beagle file will require it, but it's as easy as stripping .1 and .2 off the sample names in the beagle file.
+
+#write.table(ib_filt_beagle2, file = "lct_ib_filt_mq25_m005.beagle",sep = "\t", quote = FALSE, row.names = FALSE, col.names = TRUE)
+
+#write.table(oob_filt_beagle2, file = "lct_oob_filt_mq25_m005.beagle",sep = "\t", quote = FALSE, row.names = FALSE, col.names = TRUE)
+
+#write.table(wwh_oob_filt_beagle2, file = "lct_wwh_filt_mq25_m005.beagle",sep = "\t", quote = FALSE, row.names = FALSE, col.names = TRUE)
+
+
+```
+
+```{r oob}
+
+#looking at the OOB populations and their putative in-range sources (Tahoe, Carson)
+
+lct_oob <- lct_filt_allbasins["sample"=c(good_sample_meta_oob_and_ct$sample)]
+
+good_creek_meta_oob <- good_sample_meta_oob_and_ct %>% group_by(basin,creek,year,creek_year,lat,long,in_will,in_basin,will_name,will_ho,will_pi,will_fis,ws_will,ts_will,PVA_Extinction,PVA_Ext_L95,PVA_Ext_U95,PVA_Abundance_50,PVA_Abundance_25,PVA_Abund_Year,watershed) %>% summarise("N"=n())
+
+lct_he_oob1 <- calc_he(lct_oob, "creek.year")
+lct_filt_he_stats <- get.snpR.stats(lct_he_oob1, "creek.year", stats=c("he"))
+lct_he_oob <- lct_filt_he_stats$weighted.means
+lct_he_oob$creek <- str_split_fixed(lct_he_oob$subfacet,pattern="\\.",2)[,1]
+lct_he_oob$year <- str_split_fixed(lct_he_oob$subfacet,pattern="\\.",2)[,2]
+lct_he_oob <- data.frame("creek"=lct_he_oob$creek, "year"=as.integer(lct_he_oob$year), "he"=lct_he_oob$weighted_mean_he)
+lct_he_oob <- right_join(good_creek_meta_oob,lct_he_oob,by=c("creek","year"))
+lct_he_oob2 <- lct_he_oob
+lct_he_oob2$newcreek = str_wrap(lct_he_oob2$creek, width = 20)
+lct_he_oob2$newcreek <- gsub('_',' ',lct_he_oob2$newcreek)
+lct_he_oob2$newcreek <- reorder(lct_he_oob2$newcreek,lct_he_oob2$he,FUN=mean)
+lct_he_oob2$basin <- gsub('_',' ',lct_he_oob2$basin)
+lct_he_oob2$creek_year <- paste0(lct_he_oob2$newcreek, "<br><span style='font-size:10pt;'>", lct_he_oob2$year, "</span>")
+
+
+lct_pifis_oob <- calc_pi(lct_oob,facets="creek.year")
+lct_pifis_oob <- calc_fis(lct_pifis_oob,facets="creek.year")
+lct_pifis_oob <- calc_ho(lct_pifis_oob,facets="creek.year")
+lct_filt_pifis_stats <- get.snpR.stats(lct_pifis_oob, "creek.year", stats=c("pi","fis","ho"))
+lct_pifis_oob <- lct_filt_pifis_stats$weighted.means
+lct_pifis_oob$creek <- str_split_fixed(lct_pifis_oob$subfacet,pattern="\\.",2)[,1]
+lct_pifis_oob$year <- str_split_fixed(lct_pifis_oob$subfacet,pattern="\\.",2)[,2]
+lct_pifis_oob <- data.frame("creek"=lct_pifis_oob$creek,"year"=as.integer(lct_pifis_oob$year),"pi"=lct_pifis_oob$weighted_mean_pi, "fis"=lct_pifis_oob$weighted_mean_fis,"ho"=lct_pifis_oob$weighted_mean_ho)
+lct_all_oob <- left_join(lct_he_oob2,lct_pifis_oob,by=c("creek","year"))
+
+
+
+colnames(lct_he_oob2)[colnames(lct_he_oob2)=="in_basin"] <- "In_Range"
+lct_he_oob2$In_Range[lct_he_oob2$In_Range=="yes"] <- "In-Range"
+lct_he_oob2$In_Range[lct_he_oob2$In_Range=="no"] <- "Out-of-Range"
+
+oob_year_labels <- lct_he_oob2 %>% group_by(newcreek, basin) %>% summarise(years = n_distinct(year), .groups = "drop") %>% filter(years > 1) %>% left_join(distinct(lct_he_oob2, newcreek, year, basin), by = c("newcreek", "basin"))
+
+ggplot(lct_he_oob2, aes(x = newcreek, y = he, group = year, fill = In_Range)) + geom_point(size = 2, stroke = 0.6, shape = 21, position = position_dodge(width = 0.6)) + geom_hline(yintercept = mean(lct_all$he), color = "coral2") + geom_text(data = oob_year_labels, aes(x = newcreek, y = -0.2, label = year), position = position_dodge(width = 1), angle = 90, vjust = 0.5, hjust = 1.3, size = 1.85) + xlab("Population") + ylab(expression(paste(italic(H)[e]))) + facet_wrap(~watershed, scales = "free_x",nrow=3) +
+  fill_palette(palette = basin_palette) +
+  scale_x_discrete(labels = function(newcreek) str_wrap(newcreek, width = 20)) + theme(legend.position = "bottom",axis.text.x = element_text(angle = 90, vjust = 0.5,margin = margin(t = 16))) + labs(title=expression(paste("Expected Heterozygosity (",italic(H)[e], ") Among Out-of-Range Populations and their In-Range Putative Sources"))) + coord_cartesian(clip = "off") + theme(plot.margin = margin(10, 10, 30, 10)) +theme(text=element_text(family="PTSerif-Regular"),strip.text.x=element_text(family="PTSerif-Bold")) 
+
+
+#ggsave("~/lct/lct_14k_oob_he.svg",device=svglite)
+#ggsave("~/lct/lct_14k_oob_he.png",device="png",height=10,width=11,dpi=250)
+
+
+
+ir_carson <- filter(lct_he_oob2,In_Range=="In-Range" & watershed=="Carson")
+oor_carson <- filter(lct_he_oob2,In_Range=="Out-of-Range" & watershed=="Carson")
+
+ir_tahoe <- filter(lct_he_oob2,In_Range=="In-Range" & watershed=="Tahoe")
+oor_tahoe <- filter(lct_he_oob2,In_Range=="Out-of-Range" & watershed=="Tahoe")
+
+carson_wilcoxon <- wilcox.test(ir_carson$he,oor_carson$he)
+tahoe_wilcoxon <- wilcox.test(ir_tahoe$he,oor_tahoe$he)
+
+##PCA
+q <- plot_clusters(lct_oob, facets = c("basin"))
+b <- q$data$pca
+b$basin <- gsub('_R_OOB','_River',b$basin)
+b$basin <- gsub('_',' ',b$basin)
+colnames(b)[colnames(b) == "basin"] <- "Basin"
+
+
+oob_pca <- ggplot(b, aes(PC1, PC2, fill=Basin)) + geom_point(shape=21,size=4,stroke=0.6) + theme_bw() + theme(text=element_text(size=16,family="PTSerif-Bold"),legend.position="none",legend.text = element_text(size=14,family="PTSerif-Bold")) +xlab(paste0("PC1 (",q$pca_loadings[[1]],"%)")) + ylab(paste0("PC2 (",q$pca_loadings[[2]],"%)"))  + theme(legend.position="top") + fill_palette(palette=basin_palette) + ggtitle("PCA for Out-of-Range LCT Populations and Their Putative In-Range Sources, PC1-PC2")
+
+oob_pca
+#ggsave("~/lct/lct_14k_oob_pca_PC1_PC2.png",device="png",height=10,width=11,dpi=250)
+
+
+```
+
+```{r wwh}
+
+lct_wwh <- lct_filt_all_creeks["sample"=c(wwh_oob_sample_meta$sample)]
+
+good_creek_meta_wwh <- wwh_oob_sample_meta %>% group_by(basin,creek,year,creek_year,lat,long,in_will,in_basin,will_name,will_ho,will_pi,will_fis,ws_will,ts_will,PVA_Extinction,PVA_Ext_L95,PVA_Ext_U95,PVA_Abundance_50,PVA_Abundance_25,PVA_Abund_Year,watershed) %>% summarise("N"=n())
+
+#add in the stocked sources for the Alvord Lake pops from Peacock et al., 2010
+good_creek_meta_wwh$source <- c("Willow","Willow","Willow","Willow","Willow","Willow","Whitehorse","Willow","Native","Native","Native Whitehorse","Native Whitehorse","Native Willow","Native Willow")
+
+lct_he_wwh1 <- calc_he(lct_wwh, "creek.year")
+lct_filt_he_stats <- get.snpR.stats(lct_he_wwh1, "creek.year", stats=c("he"))
+lct_he_wwh <- lct_filt_he_stats$weighted.means
+lct_he_wwh$creek <- str_split_fixed(lct_he_wwh$subfacet,pattern="\\.",2)[,1]
+lct_he_wwh$year <- str_split_fixed(lct_he_wwh$subfacet,pattern="\\.",2)[,2]
+lct_he_wwh <- data.frame("creek"=lct_he_wwh$creek, "year"=as.integer(lct_he_wwh$year), "he"=lct_he_wwh$weighted_mean_he)
+lct_he_wwh <- right_join(good_creek_meta_wwh,lct_he_wwh,by=c("creek","year"))
+lct_he_wwh2 <- lct_he_wwh
+lct_he_wwh2$newcreek = str_wrap(lct_he_wwh2$creek, width = 20)
+lct_he_wwh2$newcreek <- gsub('_',' ',lct_he_wwh2$newcreek)
+lct_he_wwh2$newcreek <- reorder(lct_he_wwh2$newcreek,lct_he_wwh2$he,FUN=mean)
+lct_he_wwh2$basin <- gsub('_',' ',lct_he_wwh2$basin)
+lct_he_wwh2$creek_year <- paste0(lct_he_wwh2$newcreek, "<br><span style='font-size:10pt;'>", lct_he_wwh2$year, "</span>")
+
+
+colnames(lct_he_wwh2)[colnames(lct_he_wwh2)=="basin"] <- "Basin"
+colnames(lct_he_wwh2)[colnames(lct_he_wwh2)=="in_basin"] <- "In_Range"
+lct_he_wwh2$In_Range[lct_he_wwh2$In_Range=="yes"] <- "In-Range"
+lct_he_wwh2$In_Range[lct_he_wwh2$In_Range=="no"] <- "Out-of-Range"
+lct_he_wwh2$In_Range[lct_he_wwh2$In_Range==is.na(lct_he_wwh2$In_Range)] <- "Out-of-Range"
+lct_he_wwh2$Basin <- gsub("_"," ",lct_he_wwh2$Basin)
+
+
+wwh_year_labels <- lct_he_wwh2 %>% group_by(newcreek, Basin) %>% summarise(years = n_distinct(year), .groups = "drop") %>% filter(years > 1) %>% left_join(distinct(lct_he_wwh2, newcreek, year, Basin), by = c("newcreek", "Basin"))
+
+ggplot(lct_he_wwh2, aes(x = newcreek, y = he, group = year, fill = Basin)) + geom_point(size = 4, stroke = 0.6, shape = 21, position = position_dodge(width = 0.6)) + theme_bw()+ geom_text(data = wwh_year_labels, aes(x = newcreek, y = 0.04, label = year), position = position_dodge(width = 1), angle = 90, vjust = 0.75, hjust = 1.8, size = 2.65) + xlab("Population") + ylab(expression(paste(italic(H)[e]))) +
+  fill_palette(palette = basin_palette) +
+  scale_x_discrete(labels = function(newcreek) str_wrap(newcreek, width = 20)) + theme(legend.position = "bottom",axis.text.x = element_text(angle = 90, vjust = 0.5,margin = margin(t = 16))) + labs(title=expression(paste("Expected Heterozygosity (",italic(H)[e], ") Among Out-of-Range Alvord Lake Populations and their In-Range Willow-Whitehorse Sources"))) + coord_cartesian(clip = "off") + theme(plot.margin = margin(10, 10, 30, 10)) +theme(text=element_text(family="PTSerif-Regular"),strip.text.x=element_text(family="PTSerif-Bold")) 
+
+##add in pi, fis, ho for the table of results
+lct_pifis_wwh <- calc_pi(lct_wwh,facets="creek.year")
+lct_pifis_wwh <- calc_fis(lct_pifis_wwh,facets="creek.year")
+lct_pifis_wwh <- calc_ho(lct_pifis_wwh,facets="creek.year")
+lct_filt_pifis_stats <- get.snpR.stats(lct_pifis_wwh, "creek.year", stats=c("pi","fis","ho"))
+lct_pifis_wwh <- lct_filt_pifis_stats$weighted.means
+lct_pifis_wwh$creek <- str_split_fixed(lct_pifis_wwh$subfacet,pattern="\\.",2)[,1]
+lct_pifis_wwh$year <- str_split_fixed(lct_pifis_wwh$subfacet,pattern="\\.",2)[,2]
+lct_pifis_wwh <- data.frame("creek"=lct_pifis_wwh$creek,"year"=as.integer(lct_pifis_wwh$year),"pi"=lct_pifis_wwh$weighted_mean_pi, "fis"=lct_pifis_wwh$weighted_mean_fis,"ho"=lct_pifis_wwh$weighted_mean_ho)
+lct_all_wwh <- left_join(lct_he_wwh2,lct_pifis_wwh,by=c("creek","year"))
+
+#ggsave("~/lct/lct_14k_wwh_he.svg",device=svglite)
+#ggsave("~/lct/lct_14k_wwh_he.png",device="png",height=10,width=11,dpi=250)
+
+oor_wwh <- filter(lct_he_wwh2,Basin=="Alvord Lake OOB")
+ir_wwh <- filter(lct_he_wwh2, Basin!="Alvord Lake OOB")
+
+founded_willow <- filter(lct_he_wwh2, source=="Willow")
+native_willow <- filter(lct_he_wwh2,source=="Native Willow")
+
+
+wwh_wilcoxon <- wilcox.test(ir_wwh$he,oor_wwh$he)
+wwh_wilcoxon_source <- wilcox.test(founded_willow$he,native_willow$he)
+
+
+##PCA
+q <- plot_clusters(lct_wwh, facets = c("basin"))
+b <- q$data$pca
+b <- left_join(b, good_creek_meta_wwh,by=c("creek","basin","year","creek_year","lat","long","watershed","in_will","will_name","will_ho","will_fis","will_pi","ws_will","ts_will","PVA_Extinction","PVA_Ext_L95","PVA_Ext_U95","PVA_Abundance_50","PVA_Abundance_25","PVA_Abund_Year","in_basin"))
+b$basin <- gsub('_',' ',b$basin)
+colnames(b)[colnames(b) == "basin"] <- "Basin"
+
+
+
+pca_wwh_basin <- ggplot(b, aes(PC1, PC2, fill=Basin)) + geom_point(shape=21,size=5,stroke=0.75) + theme_bw() + theme(text=element_text(size=16,family="PTSerif-Bold"),legend.position="none",legend.text = element_text(size=14,family="PTSerif-Bold")) +xlab(paste0("PC1 (",q$pca_loadings[[1]],"%)")) + ylab(paste0("PC2 (",q$pca_loadings[[2]],"%)"))  + theme(legend.position="bottom") + fill_palette(palette=basin_palette) + ggtitle("PCA for Alvord Lake and Willow-Whitehorse LCT, PC1-PC2")
+
+pca_wwh_basin
+#ggsave("~/lct/lct_14k_wwh_pca_PC1_PC2.png",device="png",height=10,width=11,dpi=250)
+
+
+
+pca_wwh_source <- ggplot(b, aes(PC1, PC2, fill=source)) + geom_point(shape=21,size=5,stroke=0.75) + theme_bw() + theme(text=element_text(size=16,family="PTSerif-Bold"),legend.position="none",legend.text = element_text(size=14,family="PTSerif-Bold")) +xlab(paste0("PC1 (",q$pca_loadings[[1]],"%)")) + ylab(paste0("PC2 (",q$pca_loadings[[2]],"%)"))  + theme(legend.position="bottom") + fill_palette(palette=basin_palette) + ggtitle("PCA for Alvord Lake LCT Populations and Their Putative Willow-Whitehorse Sources, PC1-PC2")
+
+pca_wwh_source
+
+#ggsave("~/lct/lct_14k_wwh_source_pca_PC1_PC2.png",device="png",height=10,width=11,dpi=250)
+
+
+
+##Fst
+wwh.fst <- calc_pairwise_fst(lct_wwh,facets="creek")
+wwh_fst_stats <- get.snpR.stats(wwh.fst,facets="creek",stats="fst")
+wwh_fst <- wwh_fst_stats$weighted.means
+wwh_fst$creek <- str_split_fixed(wwh_fst$subfacet,"~",2)[,1]
+wwh_fst$sourceA <- good_creek_meta_wwh$source[match(wwh_fst$creek, good_creek_meta_wwh$creek)]
+wwh_fst$X <- str_split_fixed(wwh_fst$subfacet,"~",2)[,1]
+wwh_fst$creek <- str_split_fixed(wwh_fst$subfacet,"~",2)[,2]
+wwh_fst$sourceB <- good_creek_meta_wwh$source[match(wwh_fst$creek, good_creek_meta_wwh$creek)]
+wwh_fst$Y <- str_split_fixed(wwh_fst$subfacet,"~",2)[,2]
+
+
+willow_willow <- wwh_fst %>% filter(sourceA=="Willow" & sourceB=="Native Willow")
+willow_willow2 <- wwh_fst %>% filter(sourceA=="Willow" & sourceB=="Willow")
+mean(willow_willow$weighted_mean_fst)
+mean(willow_willow2$weighted_mean_fst)
+
+wwh_fst2 <- wwh_fst
+wwh_fst2$sourceA[wwh_fst2$sourceA=="Native Willow"] <- "Willow"
+wwh_fst2$sourceA[wwh_fst2$sourceA=="Native Whitehorse"] <- "Whitehorse"
+wwh_fst2$sourceB[wwh_fst2$sourceB=="Native Willow"] <- "Willow"
+wwh_fst2$sourceB[wwh_fst2$sourceB=="Native Whitehorse"] <- "Whitehorse"
+wwh_fst2$sourceA[wwh_fst2$X=="Little_Whitehorse"] <- "Whitehorse"
+wwh_fst2$sourceB[wwh_fst2$Y=="Little_Whitehorse"] <- "Whitehorse"
+wwh_fst2$sourceA[wwh_fst2$X=="Cottonwood_WWH"] <- "Willow"
+wwh_fst2$sourceB[wwh_fst2$Y=="Cottonwood_WWH"] <- "Willow"
+
+willow_wwh <- wwh_fst2 %>% filter(sourceA!=sourceB)
+
+mean(willow_wwh$weighted_mean_fst)
+
+
+```
+
+
+```{r admix}
+
+#plotting admixture for the three beagle files we made earlier. Need: directory with some qopts, the output of the ngsadmix run. Also need: ordered metadata. Admixture was run using ngsadmix for K=2 through K=10 (full in-range dataset), or K=8 (out-of-range) or K=6 (Willow-Whitehorse)
+
+#get some color options:
+clist <- list("shiny"=c("#1D72F5","#DF0101","#77CE61","#FF9326","#A945FF","#0089B2","#FDF060","#FFA6B2","#BFF217","#60D5FD","#CC1577","#F2B950","#7FB21D","#EC496F","#326397","#B26314","#027368","#A4A4A4","#610B5E"),
+  "strong"=c("#11A4C8","#63C2C5","#1D4F9F","#0C516D","#2A2771","#396D35","#80C342","#725DA8","#B62025","#ED2224","#ED1943","#ED3995","#7E277C","#F7EC16","#F8941E","#8C2A1C","#808080"),
+  "oceanfive"=c("#00A0B0", "#6A4A3C", "#CC333F", "#EB6841", "#EDC951"),
+  "keeled"=c("#48B098", "#91CB62", "#FFEE3B", "#FB9013", "#FF3C28"),
+  "vintage"=c("#400F13", "#027368", "#A3BF3F", "#F2B950", "#D93A2B"),
+  "muted"=c("#46BDDD","#82DDCE","#F5F06A","#F5CC6A","#F57E6A"),
+  "teal"=c("#CFF09E","#A8DBA8","#79BD9A","#3B8686","#0B486B"),
+  "merry"=c("#5BC0EB","#FDE74C","#9BC53D","#E55934","#FA7921"),
+  "funky"=c("#A6CEE3", "#3F8EAA", "#79C360", "#E52829", "#FDB762","#ED8F47","#9471B4"),
+  "retro"=c("#01948E","#A9C4E2","#E23560","#01A7B3","#FDA963","#323665","#EC687D"),
+  "cb_paired"=c("#A6CEE3","#1F78B4","#B2DF8A","#33A02C","#FB9A99","#E31A1C","#FDBF6F","#FF7F00","#CAB2D6","#6A3D9A","#FFFF99","#B15928"),
+  "cb_set3"=c("#8DD3C7","#FFFFB3","#BEBADA","#FB8072","#80B1D3","#FDB462","#B3DE69","#FCCDE5","#D9D9D9","#BC80BD","#CCEBC5","#FFED6F"),
+  "morris"=c("#4D94CC","#34648A","#8B658A","#9ACD32","#CC95CC","#9ACD32","#8B3A39","#CD6601","#CC5C5B","#8A4500"),
+  "wong"=c("#56B4E9","#009E73","#F0E442","#006699","#D55E00","#CC79A7"),
+  "krzywinski"=c("#006E82","#8214A0","#005AC8","#00A0FA","#FA78FA","#14D2DC","#AA0A3C","#FA7850","#0AB45A","#F0F032","#A0FA82","#FAE6BE"))
+
+
+#grabbing the actual ordered samples from the beagle to make the admix is something I did in bash, just snag the headers, pull the unique samples and remove the SNP information.
+#head -n1 lct_ib_filt_mq25_m005.beagle | tr '\t' '\n'  | uniq > lct_ib_samplist.txt
+#gsed -i 's/allele2/sample/g' lct_ib_samplist.txt 
+#tail -n+4 lct_ib_samplist.txt > lct_ib_samplist2.txt
+#mv lct_ib_samplist2.txt lct_ib_samplist.txt 
+
+#I did that for each of my three beagle files
+ib_m1 <- data.frame("sample"=samples_to_keep_ib_beagle)
+ib_adm_meta <- left_join(ib_m1, sample.meta(lct_filt),by="sample")
+ib_adm_meta$basin <- gsub("_"," ",ib_adm_meta$basin)
+colnames(ib_adm_meta)[colnames(ib_adm_meta)=="basin"] <- "Basin"
+
+#then I plotted the admixture using snpR
+
+setwd("~/lct/supp_14k_admix/ib")
+
+ib_fst_plot <- plot_structure(x="lct_ib",facet=ib_adm_meta$Basin,k=c(2,3,4),alt.palette=clist$wong,t.sizes = c(20,16,14),qsort=2,qsort_K = 4,separator_thickness = 0.6,strip_col_names="ib_adm_meta\\$*")$plot + theme(text=element_text(size=16,family="PTSerif-Bold"))
+
+#and arrange the plots with the PCA plots I made earlier
+bottom_ib <- ggarrange(ib_fst_plot, ncol=1,nrow=1,labels=c("c)"),font.label = list(size=14,family="serif"))
+
+ib_plots <- ggarrange(arranged_plots,bottom_ib, ncol=1,nrow=2,heights=c(1.25,1)) + bgcolor("white")
+ib_plots
+#ggsave("~/lct/lct_ib_14k_pca_and_admix_plot.png",device="png",height=24,width=32,dpi=250) 
+
+#arrange that with my two PCA plots to make the figure
+
+##Do the same for the OOB samples
+
+setwd("~/lct/supp_14k_admix/oob")
+
+oob_m1 <- data.frame("sample"=samples_to_keep_oob_beagle)
+oob_adm_meta <- left_join(oob_m1, sample.meta(lct_oob),by="sample")
+oob_adm_meta$basin <- gsub("_"," ",oob_adm_meta$basin)
+colnames(oob_adm_meta)[colnames(oob_adm_meta)=="basin"] <- "Basin"
+
+oob_fst_plot <- plot_structure(x="lct_oob",facet=oob_adm_meta$Basin,k=c(3),alt.palette=clist$wong,t.sizes = c(18,16,14),qsort=2,qsort_K = 4,separator_thickness = 0.6,strip_col_names="oob_adm_meta\\$*")$plot + theme(text=element_text(size=16,family="PTSerif-Bold"))
+
+
+#ggsave("~/lct/lct_oob_admix_bestk_k3.png",device="png",height=6,width=14,dpi=250)
+
+
+oob_plots <- ggarrange(oob_pca,oob_fst_plot, ncol=1,nrow=2,heights=c(2.5,1))
+oob_plots
+#ggsave("~/lct/oob_14k_pca_and_admix_plot.png",device="png",height=22,width=25,dpi=250)
+
+#and for the Willow-Whitehorse admixture.
+
+setwd("~/lct/supp_14k_admix/wwh")
+
+wwh_m1 <- data.frame("sample"=samples_to_keep_wwh_oob_beagle)
+wwh_adm_meta <- left_join(wwh_m1, sample.meta(lct_wwh),by="sample")
+wwh_adm_meta$basin <- gsub("_"," ",wwh_adm_meta$basin)
+wwh_adm_meta$creek <- gsub("_"," ",wwh_adm_meta$creek)
+colnames(wwh_adm_meta)[colnames(wwh_adm_meta)=="basin"] <- "Basin"
+colnames(wwh_adm_meta)[colnames(wwh_adm_meta)=="creek"] <- "Location"
+
+wwh_fst_plot <- plot_structure(x="lct_wwh",facet=wwh_adm_meta$Location,k=c(3),alt.palette=clist$wong,t.sizes = c(18,16,14),qsort=2,qsort_K = 4,separator_thickness = 0.6,strip_col_names="wwh_adm_meta\\$*")$plot + theme(text=element_text(size=16,family="PTSerif-Bold"))
+#ggsave("~/lct/lct_oob_admix_bestk_k3.png",device="png",height=6,width=14,dpi=250)
+
+top_wwh <- ggarrange(pca_wwh_basin,pca_wwh_source, ncol=2,nrow=1, labels = c("a)","b)"),font.label = list(size=14,family="serif"))
+
+bottom_wwh <- ggarrange(wwh_fst_plot, ncol=1,nrow=1,labels=c("c)"),font.label = list(size=14,family="serif"))
+
+wwh_plots <- ggarrange(top_wwh,bottom_wwh, ncol=1,nrow=2,heights=c(2.5,1))
+#ggsave("~/lct/wwh_14k_pca_and_admix_plot.png",device="png",height=24,width=27,dpi=250)
+
+
+```
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
